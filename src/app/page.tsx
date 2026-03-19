@@ -1,6 +1,7 @@
 "use client";
 
 import { useState, useCallback } from "react";
+import Link from "next/link";
 
 interface Bar {
   v: number;
@@ -141,6 +142,14 @@ export default function Home() {
               O
             </div>
             <span className="text-lg font-semibold tracking-tight">Optioneering</span>
+          </div>
+          <div className="flex items-center gap-4">
+            <Link
+              href="/analyze"
+              className="text-sm text-purple-400 hover:text-purple-300 transition-colors font-medium"
+            >
+              Anomaly Scanner
+            </Link>
           </div>
           <form
             onSubmit={(e) => {
