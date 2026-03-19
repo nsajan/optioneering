@@ -1,0 +1,80 @@
+generator client {
+  provider = "prisma-client"
+  output   = "../src/generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+model Stock {
+  id        String   @id @default(cuid())
+  symbol    String   @unique
+  name      String?
+  sector    String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  quotes  StockQuote[]
+  options OptionChain[]
+
+  @@index([symbol])
+}
+
+model StockQuote {
+  id        String   @id @default(cuid())
+  stockId   String
+  stock     Stock    @relation(fields: [stockId], references: [id])
+  price     Float
+  open      Float?
+  high      Float?
+  low       Float?
+  close     Float?
+  volume    BigInt?
+  date      DateTime
+  createdAt DateTime @default(now())
+
+  @@index([stockId, date])
+}
+
+model OptionChain {
+  id             String   @id @default(cuid())
+  stockId        String
+  stock          Stock    @relation(fields: [stockId], references: [id])
+  contractSymbol String
+  type           String   // "call" or "put"
+  strike         Float
+  expiration     DateTime
+  bid            Float?
+  ask            Float?
+  lastPrice      Float?
+  volume         Int?
+  openInterest   Int?
+  impliedVol     Float?
+  delta          Float?
+  gamma          Float?
+  theta          Float?
+  vega           Float?
+  fetchedAt      DateTime @default(now())
+
+  @@index([stockId, expiration])
+  @@index([contractSymbol])
+}
+
+model Watchlist {
+  id        String          @id @default(cuid())
+  name      String
+  createdAt DateTime        @default(now())
+  updatedAt DateTime        @updatedAt
+  items     WatchlistItem[]
+}
+
+model WatchlistItem {
+  id          String    @id @default(cuid())
+  watchlistId String
+  watchlist   Watchlist @relation(fields: [watchlistId], references: [id], onDelete: Cascade)
+  symbol      String
+  addedAt     DateTime  @default(now())
+
+  @@unique([watchlistId, symbol])
+}
