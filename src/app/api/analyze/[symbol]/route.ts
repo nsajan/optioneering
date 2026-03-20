@@ -87,10 +87,18 @@ interface WeekData {
   stockBars: DailyBar[];
 }
 
+interface OptionSnapshot {
+  day?: { volume: number; close: number; open: number; high: number; low: number };
+  details: { contract_type: string; strike_price: number; expiration_date: string; ticker: string };
+  greeks?: { delta: number; gamma: number; theta: number; vega: number };
+  implied_volatility: number;
+  open_interest: number;
+}
+
 // Signal types from the backtest insights
 interface Signal {
   id: string;
-  signalType: "weekly_volume" | "daily_spike" | "block_trade" | "price_divergence";
+  signalType: "weekly_volume" | "daily_spike" | "block_trade" | "price_divergence" | "put_call_ratio" | "iv_skew" | "oi_surge" | "term_structure";
   type: "call" | "put";
   otmPercent: number;
   strike: number;
@@ -438,6 +446,291 @@ export async function GET(
           }
         }
       }
+    }
+
+    // --- SIGNAL 5-8: Snapshot-based signals (IV skew, P/C ratio, OI surge, term structure) ---
+    try {
+      // Get snapshots for nearest 2 expirations to compare term structure
+      const nearExp = currentWeek.expiration;
+      const farExp = priorWeeks.length > 0 ? weeklyData[weeklyData.length - 1].expiration : null;
+
+      const nearSnap = await api<{ results?: OptionSnapshot[] }>(
+        `/v3/snapshot/options/${upper}?expiration_date=${nearExp}&limit=250`
+      );
+      const nearResults = nearSnap.results || [];
+
+      // Split into calls and puts
+      const nearCalls = nearResults.filter((s) => s.details.contract_type === "call");
+      const nearPuts = nearResults.filter((s) => s.details.contract_type === "put");
+
+      // --- SIGNAL 5: Put/Call Ratio ---
+      const totalPutVolume = nearPuts.reduce((s, p) => s + (p.day?.volume || 0), 0);
+      const totalCallVolume = nearCalls.reduce((s, c) => s + (c.day?.volume || 0), 0);
+      const totalPutOI = nearPuts.reduce((s, p) => s + (p.open_interest || 0), 0);
+      const totalCallOI = nearCalls.reduce((s, c) => s + (c.open_interest || 0), 0);
+
+      const pcVolumeRatio = totalCallVolume > 0 ? totalPutVolume / totalCallVolume : 0;
+      const pcOIRatio = totalCallOI > 0 ? totalPutOI / totalCallOI : 0;
+
+      // P/C ratio > 1.5 on volume or > 1.3 on OI is bearish signal
+      if (pcVolumeRatio > 1.5 || pcOIRatio > 1.3) {
+        const ratio = Math.max(pcVolumeRatio, pcOIRatio);
+        const metric = pcVolumeRatio > pcOIRatio ? "volume" : "open interest";
+        signals.push({
+          id: `pc_ratio_${nearExp}`,
+          signalType: "put_call_ratio",
+          type: "put",
+          otmPercent: 0,
+          strike: 0,
+          ticker: upper,
+          severity: ratio >= 3 ? "extreme" : ratio >= 2 ? "high" : "medium",
+          multiplier: Math.round(ratio * 10) / 10,
+          title: `Put/Call ratio ${Math.round(ratio * 10) / 10}x on ${metric}`,
+          description: `${nearExp} expiry: Put vol ${totalPutVolume.toLocaleString()} / Call vol ${totalCallVolume.toLocaleString()} (${pcVolumeRatio.toFixed(2)}x). Put OI ${totalPutOI.toLocaleString()} / Call OI ${totalCallOI.toLocaleString()} (${pcOIRatio.toFixed(2)}x). Elevated put activity suggests bearish positioning.`,
+          evidence: {
+            putVolume: totalPutVolume,
+            callVolume: totalCallVolume,
+            volumeRatio: Math.round(pcVolumeRatio * 100) / 100,
+            putOI: totalPutOI,
+            callOI: totalCallOI,
+            oiRatio: Math.round(pcOIRatio * 100) / 100,
+            expiration: nearExp,
+          },
+          weeklyBreakdown: [],
+        });
+      }
+
+      // --- SIGNAL 6: IV Skew (put IV vs call IV at same OTM distance) ---
+      // Compare ATM-adjacent puts vs calls IV
+      for (const pctOTM of [5, 10, 15, 20]) {
+        const putStrike = roundStrike(currentPrice * (1 - pctOTM / 100));
+        const callStrike = roundStrike(currentPrice * (1 + pctOTM / 100));
+
+        const matchPut = nearPuts.find((p) => Math.abs(p.details.strike_price - putStrike) < 1);
+        const matchCall = nearCalls.find((c) => Math.abs(c.details.strike_price - callStrike) < 1);
+
+        if (matchPut && matchCall && matchPut.implied_volatility > 0 && matchCall.implied_volatility > 0) {
+          const skew = matchPut.implied_volatility / matchCall.implied_volatility;
+
+          // Skew > 1.3 means puts are significantly more expensive (fear/hedging)
+          if (skew > 1.3) {
+            signals.push({
+              id: `iv_skew_${pctOTM}`,
+              signalType: "iv_skew",
+              type: "put",
+              otmPercent: pctOTM,
+              strike: putStrike,
+              ticker: matchPut.details.ticker,
+              severity: skew >= 2 ? "extreme" : skew >= 1.6 ? "high" : "medium",
+              multiplier: Math.round(skew * 10) / 10,
+              title: `IV skew ${skew.toFixed(1)}x — puts ${pctOTM}% OTM priced for fear`,
+              description: `Put $${putStrike} IV: ${(matchPut.implied_volatility * 100).toFixed(0)}% vs Call $${callStrike} IV: ${(matchCall.implied_volatility * 100).toFixed(0)}%. Market pricing in significantly higher downside risk.`,
+              evidence: {
+                putStrike: putStrike,
+                putIV: Math.round(matchPut.implied_volatility * 10000) / 100,
+                callStrike: callStrike,
+                callIV: Math.round(matchCall.implied_volatility * 10000) / 100,
+                skewRatio: Math.round(skew * 100) / 100,
+                putOI: matchPut.open_interest,
+                callOI: matchCall.open_interest,
+              },
+              weeklyBreakdown: [],
+            });
+          }
+        }
+      }
+
+      // --- SIGNAL 7: OI Surge (compare OI at same OTM% across expirations) ---
+      // Compare nearest expiration's OI vs next 3 weekly expirations at the same OTM%.
+      // Each comparison is relative to current stock price — same OTM distance, different expiry.
+      // Also include prior week expirations if snapshot data is available (relative to that week's stock price).
+      // A surge in near-term OI = someone loading cheap, leveraged directional bets before a catalyst.
+      const oiOtmBuckets = [5, 10, 15, 20, 30, 40];
+
+      // Get next 3 weekly expirations after the nearest one for forward comparison
+      const futureExps: string[] = [];
+      const futureExpDate = new Date(nearExp);
+      for (let i = 0; i < 3; i++) {
+        futureExpDate.setDate(futureExpDate.getDate() + 7);
+        futureExps.push(fmtDate(futureExpDate));
+      }
+
+      // Fetch forward + prior week snapshots in parallel
+      const comparisonSnaps: { expiration: string; stockPrice: number; results: OptionSnapshot[] }[] = [];
+      const snapFetches = [
+        // Forward expirations (use current stock price for OTM calc)
+        ...futureExps.map(async (exp) => {
+          try {
+            const snap = await api<{ results?: OptionSnapshot[] }>(
+              `/v3/snapshot/options/${upper}?expiration_date=${exp}&limit=250`
+            );
+            if (snap.results?.length) {
+              comparisonSnaps.push({ expiration: exp, stockPrice: currentPrice, results: snap.results });
+            }
+          } catch { /* skip unavailable */ }
+        }),
+        // Prior week expirations (use that week's stock price for OTM calc)
+        ...priorWeeks.map(async (week) => {
+          try {
+            const snap = await api<{ results?: OptionSnapshot[] }>(
+              `/v3/snapshot/options/${upper}?expiration_date=${week.expiration}&limit=250`
+            );
+            if (snap.results?.length) {
+              comparisonSnaps.push({ expiration: week.expiration, stockPrice: week.stockPrice, results: snap.results });
+            }
+          } catch { /* skip expired/unavailable */ }
+        }),
+      ];
+      await Promise.all(snapFetches);
+
+      for (const pctOTM of oiOtmBuckets) {
+        for (const optType of ["put", "call"] as const) {
+          const sign = optType === "put" ? -1 : 1;
+          const currentStrike = roundStrike(currentPrice * (1 + sign * pctOTM / 100));
+          const currentContracts = optType === "put" ? nearPuts : nearCalls;
+          const current = currentContracts.find(
+            (c) => Math.abs(c.details.strike_price - currentStrike) < 1
+          );
+          if (!current || !current.open_interest || current.open_interest < 100) continue;
+
+          // Find equivalent OTM strike in each comparison expiration
+          const compOIs: { expiration: string; strike: number; oi: number }[] = [];
+          for (const snap of comparisonSnaps) {
+            const compStrike = roundStrike(snap.stockPrice * (1 + sign * pctOTM / 100));
+            const match = snap.results.find(
+              (s) =>
+                s.details.contract_type === optType &&
+                Math.abs(s.details.strike_price - compStrike) < 1
+            );
+            if (match && match.open_interest > 0) {
+              compOIs.push({
+                expiration: snap.expiration,
+                strike: match.details.strike_price,
+                oi: match.open_interest,
+              });
+            }
+          }
+
+          if (compOIs.length === 0) continue;
+
+          const avgCompOI = compOIs.reduce((s, p) => s + p.oi, 0) / compOIs.length;
+          const oiMult = avgCompOI > 0 ? current.open_interest / avgCompOI : 0;
+
+          if (oiMult >= 2 && current.open_interest > 500) {
+            const direction = optType === "put" ? "bearish" : "bullish";
+            signals.push({
+              id: `oi_surge_${optType}_${pctOTM}`,
+              signalType: "oi_surge",
+              type: optType,
+              otmPercent: pctOTM,
+              strike: current.details.strike_price,
+              ticker: current.details.ticker,
+              severity: oiMult >= 8 ? "extreme" : oiMult >= 4 ? "high" : oiMult >= 2 ? "medium" : "low",
+              multiplier: Math.round(oiMult * 10) / 10,
+              title: `${optType.toUpperCase()} OI ${oiMult.toFixed(1)}x vs other expirations at ${pctOTM}% OTM`,
+              description: `${optType.toUpperCase()} $${current.details.strike_price} (${pctOTM}% OTM, exp ${nearExp}) has ${current.open_interest.toLocaleString()} OI vs avg ${Math.round(avgCompOI).toLocaleString()} OI at equivalent OTM strikes across ${compOIs.length} other expirations. Near-term ${direction} positioning.`,
+              evidence: {
+                currentStrike: current.details.strike_price,
+                currentOI: current.open_interest,
+                currentExpiration: nearExp,
+                avgComparisonOI: Math.round(avgCompOI),
+                comparisons: compOIs,
+                iv: Math.round((current.implied_volatility || 0) * 10000) / 100,
+              },
+              weeklyBreakdown: [
+                {
+                  expiration: nearExp,
+                  strike: current.details.strike_price,
+                  totalVolume: current.open_interest,
+                  dailyAvgVolume: current.open_interest,
+                },
+                ...compOIs.map((p) => ({
+                  expiration: p.expiration,
+                  strike: p.strike,
+                  totalVolume: p.oi,
+                  dailyAvgVolume: p.oi,
+                })),
+              ],
+            });
+          }
+        }
+      }
+
+      // --- SIGNAL 8: Term Structure (near-term IV >> far-term IV = event expected soon) ---
+      if (farExp) {
+        const farSnap = await api<{ results?: OptionSnapshot[] }>(
+          `/v3/snapshot/options/${upper}?expiration_date=${farExp}&limit=250`
+        );
+        const farResults = farSnap.results || [];
+        const farPuts = farResults.filter((s) => s.details.contract_type === "put");
+        const farCalls = farResults.filter((s) => s.details.contract_type === "call");
+
+        // Compare ATM put IV near vs far
+        const atmStrike = roundStrike(currentPrice);
+        const nearATMPut = nearPuts.find((p) => Math.abs(p.details.strike_price - atmStrike) <= 2);
+        const farATMPut = farPuts.find((p) => Math.abs(p.details.strike_price - atmStrike) <= 2);
+        const nearATMCall = nearCalls.find((c) => Math.abs(c.details.strike_price - atmStrike) <= 2);
+        const farATMCall = farCalls.find((c) => Math.abs(c.details.strike_price - atmStrike) <= 2);
+
+        // Check puts term structure inversion
+        if (nearATMPut && farATMPut && nearATMPut.implied_volatility > 0 && farATMPut.implied_volatility > 0) {
+          const termRatio = nearATMPut.implied_volatility / farATMPut.implied_volatility;
+          if (termRatio > 1.2) {
+            signals.push({
+              id: `term_put_${atmStrike}`,
+              signalType: "term_structure",
+              type: "put",
+              otmPercent: 0,
+              strike: atmStrike,
+              ticker: nearATMPut.details.ticker,
+              severity: termRatio >= 1.8 ? "extreme" : termRatio >= 1.5 ? "high" : "medium",
+              multiplier: Math.round(termRatio * 10) / 10,
+              title: `Put term structure inverted ${termRatio.toFixed(1)}x — near-term event expected`,
+              description: `ATM put IV: ${(nearATMPut.implied_volatility * 100).toFixed(0)}% (${nearExp}) vs ${(farATMPut.implied_volatility * 100).toFixed(0)}% (${farExp}). Near-term IV premium signals market expects an imminent catalyst.`,
+              evidence: {
+                nearExpiration: nearExp,
+                nearIV: Math.round(nearATMPut.implied_volatility * 10000) / 100,
+                farExpiration: farExp,
+                farIV: Math.round(farATMPut.implied_volatility * 10000) / 100,
+                termRatio: Math.round(termRatio * 100) / 100,
+                strike: atmStrike,
+              },
+              weeklyBreakdown: [],
+            });
+          }
+        }
+
+        // Check calls term structure inversion
+        if (nearATMCall && farATMCall && nearATMCall.implied_volatility > 0 && farATMCall.implied_volatility > 0) {
+          const termRatio = nearATMCall.implied_volatility / farATMCall.implied_volatility;
+          if (termRatio > 1.2) {
+            signals.push({
+              id: `term_call_${atmStrike}`,
+              signalType: "term_structure",
+              type: "call",
+              otmPercent: 0,
+              strike: atmStrike,
+              ticker: nearATMCall.details.ticker,
+              severity: termRatio >= 1.8 ? "extreme" : termRatio >= 1.5 ? "high" : "medium",
+              multiplier: Math.round(termRatio * 10) / 10,
+              title: `Call term structure inverted ${termRatio.toFixed(1)}x — near-term event expected`,
+              description: `ATM call IV: ${(nearATMCall.implied_volatility * 100).toFixed(0)}% (${nearExp}) vs ${(farATMCall.implied_volatility * 100).toFixed(0)}% (${farExp}). Near-term IV premium signals market expects an imminent catalyst.`,
+              evidence: {
+                nearExpiration: nearExp,
+                nearIV: Math.round(nearATMCall.implied_volatility * 10000) / 100,
+                farExpiration: farExp,
+                farIV: Math.round(farATMCall.implied_volatility * 10000) / 100,
+                termRatio: Math.round(termRatio * 100) / 100,
+                strike: atmStrike,
+              },
+              weeklyBreakdown: [],
+            });
+          }
+        }
+      }
+    } catch (snapshotError) {
+      // Snapshot signals are best-effort — don't fail the whole analysis
+      console.warn("Snapshot-based signals unavailable:", snapshotError);
     }
 
     // Sort: extreme/high first, then by multiplier
