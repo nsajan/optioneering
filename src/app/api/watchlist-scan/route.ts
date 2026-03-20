@@ -174,9 +174,11 @@ async function fastScan(ticker: string): Promise<TickerResult> {
       ? priorAvgs.reduce((s, v) => s + v, 0) / priorAvgs.length
       : 0;
 
-    // Weekly volume signal
-    const weeklyMult = histAvg > 0 ? dailyAvg / histAvg : dailyAvg > 0 ? 999 : 0;
-    if (weeklyMult >= 3) {
+    // Weekly volume signal — cap at 20x when no baseline, require meaningful volume
+    const weeklyMult = histAvg > 0 ? dailyAvg / histAvg : dailyAvg >= 50 ? 20 : 0;
+    const minDailyVol = current.otmPercent >= 30 ? 10 : current.otmPercent >= 20 ? 20 : 75;
+    const minWeeklyMult = histAvg < 5 ? 10 : 3;
+    if (weeklyMult >= minWeeklyMult && dailyAvg >= minDailyVol) {
       signals.push({
         signalType: "weekly_volume",
         type: current.type,
@@ -207,8 +209,10 @@ async function fastScan(ticker: string): Promise<TickerResult> {
         ? priorLast2.reduce((s, v) => s + v, 0) / priorLast2.length
         : 0;
 
-      const dailyMult = histLast2 > 0 ? last2Avg / histLast2 : last2Avg > 10 ? 999 : 0;
-      if (dailyMult >= 3 && last2Avg > 10) {
+      const dailyMult = histLast2 > 0 ? last2Avg / histLast2 : last2Avg >= 50 ? 20 : 0;
+      const minLast2Vol = current.otmPercent >= 30 ? 10 : current.otmPercent >= 20 ? 20 : 75;
+      const minDailyMult = histLast2 < 5 ? 10 : 3;
+      if (dailyMult >= minDailyMult && last2Avg >= minLast2Vol) {
         signals.push({
           signalType: "daily_spike",
           type: current.type,
@@ -237,8 +241,9 @@ async function fastScan(ticker: string): Promise<TickerResult> {
           ? priorSizes.reduce((s, v) => s + v, 0) / priorSizes.length
           : 0;
 
-        const sizeMult = histSize > 0 ? avgSize / histSize : avgSize > 10 ? 999 : 0;
-        if (sizeMult >= 3 && avgSize >= 10) {
+        const sizeMult = histSize > 0 ? avgSize / histSize : avgSize >= 50 ? 20 : 0;
+        const minBlockVol = current.otmPercent >= 20 ? 50 : 100;
+        if (sizeMult >= 3 && avgSize >= 15 && bar.v >= minBlockVol) {
           const date = new Date(bar.t).toISOString().split("T")[0];
           signals.push({
             signalType: "block_trade",

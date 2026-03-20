@@ -304,12 +304,18 @@ export async function GET(
         ];
 
         // --- SIGNAL 1: Weekly Volume Anomaly ---
+        // When historical baseline is 0, cap multiplier and require meaningful volume
         const weeklyMult =
           historicalAvgDaily > 0
             ? current.dailyAvgVolume / historicalAvgDaily
-            : current.dailyAvgVolume > 0 ? 999 : 0;
+            : current.dailyAvgVolume >= 50 ? 20 : 0; // need 50+/day to flag with no baseline
 
-        if (weeklyMult >= 2) {
+        // Scale minimum volume by OTM tier — near-money options trade heavily normally
+        const minDailyVol = current.otmPercent >= 30 ? 10 : current.otmPercent >= 20 ? 20 : 75;
+        // Require stronger multiplier when baseline is thin (< 5/day) to avoid noise
+        const minWeeklyMult = historicalAvgDaily < 5 ? 10 : 3;
+
+        if (weeklyMult >= minWeeklyMult && current.dailyAvgVolume >= minDailyVol) {
           signals.push({
             id: `weekly_${type}_${current.otmPercent}`,
             signalType: "weekly_volume",
@@ -349,9 +355,13 @@ export async function GET(
               ? priorLast2Avgs.reduce((s, v) => s + v, 0) / priorLast2Avgs.length
               : 0;
 
-          const dailyMult = histLast2Avg > 0 ? last2Avg / histLast2Avg : last2Avg > 10 ? 999 : 0;
+          const dailyMult = histLast2Avg > 0 ? last2Avg / histLast2Avg : last2Avg >= 50 ? 20 : 0;
 
-          if (dailyMult >= 2 && last2Avg > 10) {
+          // Same OTM-scaled thresholds as weekly volume
+          const minLast2Vol = current.otmPercent >= 30 ? 10 : current.otmPercent >= 20 ? 20 : 75;
+          const minDailyMult = histLast2Avg < 5 ? 10 : 3;
+
+          if (dailyMult >= minDailyMult && last2Avg >= minLast2Vol) {
             signals.push({
               id: `daily_${type}_${current.otmPercent}`,
               signalType: "daily_spike",
@@ -390,9 +400,10 @@ export async function GET(
                 ? priorSizes.reduce((s, v) => s + v, 0) / priorSizes.length
                 : 0;
 
-            const sizeMult = histAvgSize > 0 ? avgSize / histAvgSize : avgSize > 10 ? 999 : 0;
+            const sizeMult = histAvgSize > 0 ? avgSize / histAvgSize : avgSize >= 50 ? 20 : 0;
+            const minBlockVol = current.otmPercent >= 20 ? 50 : 100;
 
-            if (sizeMult >= 3 && avgSize >= 10) {
+            if (sizeMult >= 3 && avgSize >= 15 && bar.volume >= minBlockVol) {
               signals.push({
                 id: `block_${type}_${current.otmPercent}_${bar.date}`,
                 signalType: "block_trade",
@@ -423,7 +434,7 @@ export async function GET(
           const prevBar = currentBars[currentBars.length - 2];
           const stockBars = currentWeek.stockBars;
 
-          if (stockBars.length >= 2 && prevBar.close > 0 && lastBar.close > 0) {
+          if (stockBars.length >= 2 && prevBar.close >= 0.10 && lastBar.close >= 0.10) {
             const lastStockBar = stockBars[stockBars.length - 1];
             const prevStockBar = stockBars[stockBars.length - 2];
 
@@ -432,10 +443,11 @@ export async function GET(
 
             // For calls: option price UP while stock DOWN is suspicious
             // For puts: option price UP while stock UP is suspicious
+            // Require meaningful option price (>= $0.10) to avoid penny-option noise
             const isDivergent =
               type === "call"
-                ? optionChange > 0.05 && stockChange < -0.01
-                : optionChange > 0.05 && stockChange > 0.01;
+                ? optionChange > 0.15 && stockChange < -0.02
+                : optionChange > 0.15 && stockChange > 0.02;
 
             if (isDivergent) {
               const optPctStr = `${optionChange >= 0 ? "+" : ""}${(optionChange * 100).toFixed(0)}%`;
@@ -494,8 +506,9 @@ export async function GET(
       const pcVolumeRatio = totalCallVolume > 0 ? totalPutVolume / totalCallVolume : 0;
       const pcOIRatio = totalCallOI > 0 ? totalPutOI / totalCallOI : 0;
 
-      // P/C ratio > 1.5 on volume or > 1.3 on OI is bearish signal
-      if (pcVolumeRatio > 1.5 || pcOIRatio > 1.3) {
+      // P/C ratio > 3.0 on volume or > 2.0 on OI is bearish signal
+      // Require minimum total volume to avoid noise from low-volume options
+      if ((pcVolumeRatio > 3.0 || pcOIRatio > 2.0) && (totalPutVolume + totalCallVolume) > 5000) {
         const ratio = Math.max(pcVolumeRatio, pcOIRatio);
         const metric = pcVolumeRatio > pcOIRatio ? "volume" : "open interest";
         signals.push({
@@ -524,7 +537,8 @@ export async function GET(
 
       // --- SIGNAL 6: IV Skew (put IV vs call IV at same OTM distance) ---
       // Compare ATM-adjacent puts vs calls IV
-      for (const pctOTM of [5, 10, 15, 20]) {
+      // Skip 5% OTM — all stocks have natural put skew at near-money strikes (volatility smile)
+      for (const pctOTM of [10, 15, 20]) {
         const putStrike = roundStrike(currentPrice * (1 - pctOTM / 100));
         const callStrike = roundStrike(currentPrice * (1 + pctOTM / 100));
 
@@ -534,8 +548,9 @@ export async function GET(
         if (matchPut && matchCall && matchPut.implied_volatility > 0 && matchCall.implied_volatility > 0) {
           const skew = matchPut.implied_volatility / matchCall.implied_volatility;
 
-          // Skew > 1.3 means puts are significantly more expensive (fear/hedging)
-          if (skew > 1.3) {
+          // Skew > 1.5 means puts are significantly more expensive (fear/hedging)
+          // Normal put skew on large-caps is 1.1-1.3x, so 1.5x is genuinely unusual
+          if (skew > 1.5) {
             signals.push({
               id: `iv_skew_${pctOTM}`,
               signalType: "iv_skew",
@@ -543,7 +558,7 @@ export async function GET(
               otmPercent: pctOTM,
               strike: putStrike,
               ticker: matchPut.details.ticker,
-              severity: skew >= 2 ? "extreme" : skew >= 1.6 ? "high" : "medium",
+              severity: skew >= 2.5 ? "extreme" : skew >= 2 ? "high" : "medium",
               multiplier: Math.round(skew * 10) / 10,
               title: `IV skew ${skew.toFixed(1)}x — puts ${pctOTM}% OTM priced for fear`,
               description: `Put $${putStrike} IV: ${(matchPut.implied_volatility * 100).toFixed(0)}% vs Call $${callStrike} IV: ${(matchCall.implied_volatility * 100).toFixed(0)}%. Market pricing in significantly higher downside risk.`,
@@ -633,12 +648,13 @@ export async function GET(
             }
           }
 
-          if (compOIs.length === 0) continue;
+          if (compOIs.length < 3) continue; // Need at least 3 expirations for meaningful comparison
 
           const avgCompOI = compOIs.reduce((s, p) => s + p.oi, 0) / compOIs.length;
           const oiMult = avgCompOI > 0 ? current.open_interest / avgCompOI : 0;
 
-          if (oiMult >= 2 && current.open_interest > 500) {
+          // Very high bar: nearest expiry naturally concentrates OI, so only flag extreme outliers
+          if (oiMult >= 10 && current.open_interest > 5000 && avgCompOI > 100) {
             const direction = optType === "put" ? "bearish" : "bullish";
             signals.push({
               id: `oi_surge_${optType}_${pctOTM}`,
@@ -647,7 +663,7 @@ export async function GET(
               otmPercent: pctOTM,
               strike: current.details.strike_price,
               ticker: current.details.ticker,
-              severity: oiMult >= 8 ? "extreme" : oiMult >= 4 ? "high" : oiMult >= 2 ? "medium" : "low",
+              severity: oiMult >= 15 ? "extreme" : oiMult >= 8 ? "high" : oiMult >= 5 ? "medium" : "low",
               multiplier: Math.round(oiMult * 10) / 10,
               title: `${optType.toUpperCase()} OI ${oiMult.toFixed(1)}x vs other expirations at ${pctOTM}% OTM`,
               description: `${optType.toUpperCase()} $${current.details.strike_price} (${pctOTM}% OTM, exp ${nearExp}) has ${current.open_interest.toLocaleString()} OI vs avg ${Math.round(avgCompOI).toLocaleString()} OI at equivalent OTM strikes across ${compOIs.length} other expirations. Near-term ${direction} positioning.`,
@@ -697,7 +713,7 @@ export async function GET(
         // Check puts term structure inversion
         if (nearATMPut && farATMPut && nearATMPut.implied_volatility > 0 && farATMPut.implied_volatility > 0) {
           const termRatio = nearATMPut.implied_volatility / farATMPut.implied_volatility;
-          if (termRatio > 1.2) {
+          if (termRatio > 1.35) {
             signals.push({
               id: `term_put_${atmStrike}`,
               signalType: "term_structure",
@@ -725,7 +741,7 @@ export async function GET(
         // Check calls term structure inversion
         if (nearATMCall && farATMCall && nearATMCall.implied_volatility > 0 && farATMCall.implied_volatility > 0) {
           const termRatio = nearATMCall.implied_volatility / farATMCall.implied_volatility;
-          if (termRatio > 1.2) {
+          if (termRatio > 1.35) {
             signals.push({
               id: `term_call_${atmStrike}`,
               signalType: "term_structure",
@@ -767,6 +783,22 @@ export async function GET(
     const flaggedSignals = signals.filter((s) => s.severity !== "low");
     const normalSignals = signals.filter((s) => s.severity === "low");
 
+    // Compute confidence based on signal diversity — real insider activity spans multiple OTM tiers
+    const otmTiersHit = new Set(flaggedSignals.map((s) => s.otmPercent)).size;
+    const hasFarOTM = flaggedSignals.some((s) => s.otmPercent >= 20);
+    const maxMult = flaggedSignals.length > 0 ? Math.max(...flaggedSignals.map((s) => s.multiplier)) : 0;
+    const isDirectional = flaggedSignals.length > 0 && (
+      flaggedSignals.every((s) => s.type === "call" || s.signalType === "put_call_ratio" || s.signalType === "iv_skew" || s.signalType === "term_structure") ||
+      flaggedSignals.every((s) => s.type === "put" || s.signalType === "put_call_ratio" || s.signalType === "iv_skew" || s.signalType === "term_structure")
+    );
+
+    let confidence: "high" | "medium" | "low" = "low";
+    if ((otmTiersHit >= 3 && hasFarOTM && maxMult >= 10) || (maxMult >= 20 && hasFarOTM)) {
+      confidence = "high";
+    } else if (otmTiersHit >= 2 || hasFarOTM || (maxMult >= 10 && isDirectional)) {
+      confidence = "medium";
+    }
+
     return NextResponse.json({
       ticker: upper,
       currentPrice,
@@ -774,6 +806,7 @@ export async function GET(
       currentExpiration: currentWeek.expiration,
       analyzedExpirations: weeklyData.map((w) => w.expiration),
       hasAnomaly: flaggedSignals.length > 0,
+      confidence,
       signalCount: flaggedSignals.length,
       signals: flaggedSignals,
       normalSignals,
