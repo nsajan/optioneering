@@ -162,17 +162,38 @@ export async function GET(
 ) {
   const { symbol } = await params;
   const upper = symbol.toUpperCase();
+  const searchParams = request.nextUrl.searchParams;
+  const asOfParam = searchParams.get("asOf"); // Optional: YYYY-MM-DD to backtest
 
   try {
-    // 1. Get current stock price + recent bars
-    const prevDay = await api<{ results: BarResult[] }>(`/v2/aggs/ticker/${upper}/prev`);
-    const currentPrice = prevDay.results?.[0]?.c;
-    if (!currentPrice) {
-      return NextResponse.json({ error: "Could not get stock price" }, { status: 404 });
+    // 1. Get stock price (as-of date or current)
+    const asOfDate = asOfParam ? new Date(asOfParam + "T12:00:00Z") : null;
+    let currentPrice: number;
+
+    if (asOfDate) {
+      // Backtest mode: get the closing price on or before the asOf date
+      const lookback = new Date(asOfDate);
+      lookback.setDate(lookback.getDate() - 5);
+      const historicalBars = await api<{ results?: BarResult[] }>(
+        `/v2/aggs/ticker/${upper}/range/1/day/${fmtDate(lookback)}/${fmtDate(asOfDate)}`
+      );
+      const bars = historicalBars.results || [];
+      const lastBar = bars[bars.length - 1];
+      if (!lastBar) {
+        return NextResponse.json({ error: "Could not get stock price for that date" }, { status: 404 });
+      }
+      currentPrice = lastBar.c;
+    } else {
+      const prevDay = await api<{ results: BarResult[] }>(`/v2/aggs/ticker/${upper}/prev`);
+      currentPrice = prevDay.results?.[0]?.c;
+      if (!currentPrice) {
+        return NextResponse.json({ error: "Could not get stock price" }, { status: 404 });
+      }
     }
 
-    // 2. Get 4 Fridays (this week + 3 prior)
-    const fridays = getFridays(new Date(), 4);
+    // 2. Get 4 Fridays (this week + 3 prior, relative to asOf date or today)
+    const referenceDate = asOfDate || new Date();
+    const fridays = getFridays(referenceDate, 4);
     const otmPercents = [10, 15, 20, 30, 40];
 
     // 3. Gather weekly data
@@ -449,7 +470,8 @@ export async function GET(
     }
 
     // --- SIGNAL 5-8: Snapshot-based signals (IV skew, P/C ratio, OI surge, term structure) ---
-    try {
+    // Skip in backtest mode — snapshots only work for live/future expirations
+    if (!asOfDate) try {
       // Get snapshots for nearest 2 expirations to compare term structure
       const nearExp = currentWeek.expiration;
       const farExp = priorWeeks.length > 0 ? weeklyData[weeklyData.length - 1].expiration : null;
@@ -748,6 +770,7 @@ export async function GET(
     return NextResponse.json({
       ticker: upper,
       currentPrice,
+      ...(asOfDate ? { asOf: fmtDate(asOfDate), backtestMode: true } : {}),
       currentExpiration: currentWeek.expiration,
       analyzedExpirations: weeklyData.map((w) => w.expiration),
       hasAnomaly: flaggedSignals.length > 0,

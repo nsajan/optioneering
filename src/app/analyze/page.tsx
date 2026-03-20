@@ -5,7 +5,7 @@ import Link from "next/link";
 
 interface Signal {
   id: string;
-  signalType: "weekly_volume" | "daily_spike" | "block_trade" | "price_divergence";
+  signalType: "weekly_volume" | "daily_spike" | "block_trade" | "price_divergence" | "put_call_ratio" | "iv_skew" | "oi_surge" | "term_structure";
   type: "call" | "put";
   otmPercent: number;
   strike: number;
@@ -56,6 +56,8 @@ interface WeekData {
 interface AnalysisResult {
   ticker: string;
   currentPrice: number;
+  asOf?: string;
+  backtestMode?: boolean;
   currentExpiration: string;
   analyzedExpirations: string[];
   hasAnomaly: boolean;
@@ -72,6 +74,10 @@ const SIGNAL_TYPE_LABELS: Record<string, { label: string; icon: string; color: s
   daily_spike: { label: "Daily Spike", icon: "D", color: "purple" },
   block_trade: { label: "Block Trade", icon: "B", color: "amber" },
   price_divergence: { label: "Price Divergence", icon: "P", color: "rose" },
+  put_call_ratio: { label: "Put/Call Ratio", icon: "R", color: "rose" },
+  iv_skew: { label: "IV Skew", icon: "S", color: "purple" },
+  oi_surge: { label: "OI Surge", icon: "O", color: "blue" },
+  term_structure: { label: "Term Structure", icon: "T", color: "amber" },
 };
 
 export default function AnalyzePage() {
@@ -81,6 +87,7 @@ export default function AnalyzePage() {
   const [error, setError] = useState("");
   const [expandedSignal, setExpandedSignal] = useState<string | null>(null);
   const [filterType, setFilterType] = useState<string>("all");
+  const [asOf, setAsOf] = useState("");
 
   const analyze = async (ticker?: string) => {
     const t = (ticker || symbol).trim().toUpperCase();
@@ -92,7 +99,8 @@ export default function AnalyzePage() {
     setExpandedSignal(null);
 
     try {
-      const res = await fetch(`/api/analyze/${t}`);
+      const query = asOf ? `?asOf=${asOf}` : "";
+      const res = await fetch(`/api/analyze/${t}${query}`);
       const json = await res.json();
       if (json.error) throw new Error(json.error);
       setData(json);
@@ -145,14 +153,32 @@ export default function AnalyzePage() {
             <span className="text-zinc-600">|</span>
             <span className="text-sm text-zinc-400">Anomaly Scanner</span>
           </div>
-          <form onSubmit={(e) => { e.preventDefault(); analyze(); }} className="flex gap-2">
+          <form onSubmit={(e) => { e.preventDefault(); analyze(); }} className="flex gap-2 items-center">
             <input
               type="text"
               value={symbol}
               onChange={(e) => setSymbol(e.target.value.toUpperCase())}
               placeholder="Ticker..."
-              className="w-36 sm:w-48 bg-zinc-900/80 border border-zinc-700/50 rounded-lg px-4 py-2 text-sm text-zinc-100 placeholder-zinc-600 focus:outline-none focus:ring-2 focus:ring-purple-500/50 transition-all"
+              className="w-28 sm:w-36 bg-zinc-900/80 border border-zinc-700/50 rounded-lg px-4 py-2 text-sm text-zinc-100 placeholder-zinc-600 focus:outline-none focus:ring-2 focus:ring-purple-500/50 transition-all"
             />
+            <div className="relative">
+              <input
+                type="date"
+                value={asOf}
+                onChange={(e) => setAsOf(e.target.value)}
+                className="bg-zinc-900/80 border border-zinc-700/50 rounded-lg px-3 py-2 text-sm text-zinc-100 focus:outline-none focus:ring-2 focus:ring-purple-500/50 transition-all [color-scheme:dark]"
+              />
+              {!asOf && (
+                <span className="absolute left-3 top-1/2 -translate-y-1/2 text-zinc-600 text-xs pointer-events-none">
+                  Backtest date
+                </span>
+              )}
+            </div>
+            {asOf && (
+              <button type="button" onClick={() => setAsOf("")} className="text-xs text-zinc-500 hover:text-zinc-300 px-1">
+                Live
+              </button>
+            )}
             <button
               type="submit"
               disabled={loading}
@@ -163,7 +189,7 @@ export default function AnalyzePage() {
                   <span className="w-3 h-3 border-2 border-white/30 border-t-white rounded-full animate-spin" />
                   Scanning
                 </span>
-              ) : "Scan"}
+              ) : asOf ? "Backtest" : "Scan"}
             </button>
           </form>
         </div>
@@ -207,6 +233,11 @@ export default function AnalyzePage() {
                   <span className="text-2xl font-mono text-zinc-300">${data.currentPrice.toFixed(2)}</span>
                 </div>
                 <p className="text-zinc-500 text-sm mt-1">
+                  {data.backtestMode && (
+                    <span className="inline-block mr-2 px-2 py-0.5 rounded bg-amber-500/15 text-amber-400 text-[10px] font-bold uppercase tracking-wider ring-1 ring-amber-500/30">
+                      Backtest {data.asOf}
+                    </span>
+                  )}
                   Expiry: {data.currentExpiration} &middot; vs {data.analyzedExpirations.slice(1).join(", ")}
                 </p>
               </div>
