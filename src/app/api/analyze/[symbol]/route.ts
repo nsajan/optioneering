@@ -98,7 +98,7 @@ interface OptionSnapshot {
 // Signal types from the backtest insights
 interface Signal {
   id: string;
-  signalType: "weekly_volume" | "daily_spike" | "block_trade" | "price_divergence" | "put_call_ratio" | "iv_skew" | "oi_surge" | "term_structure";
+  signalType: "weekly_volume" | "daily_spike" | "block_trade" | "price_divergence" | "put_call_ratio" | "iv_skew" | "oi_surge" | "term_structure" | "forward_positioning" | "forward_premium";
   type: "call" | "put";
   otmPercent: number;
   strike: number;
@@ -263,6 +263,79 @@ export async function GET(
         calls,
         puts,
         stockBars: sBars.map(barToDailyBar),
+      });
+    }
+
+    // 3b. Gather forward-week positioning data
+    // For each week, fetch volume of NEXT week's expiration options during THAT week
+    interface ForwardWeekData {
+      weekRange: { start: string; end: string };
+      nextExpiration: string;
+      calls: StrikeData[];
+      puts: StrikeData[];
+    }
+
+    const forwardData: ForwardWeekData[] = [];
+
+    for (let i = 0; i < fridays.length; i++) {
+      const fri = fridays[i];
+      const nextFri = new Date(fri);
+      nextFri.setDate(nextFri.getDate() + 7);
+
+      const weekStart = new Date(fri);
+      weekStart.setDate(weekStart.getDate() - 4);
+      const stockPrice = weeklyData[i].stockPrice;
+
+      const fwdCalls: StrikeData[] = [];
+      const fwdPuts: StrikeData[] = [];
+      const fwdFetches: Promise<void>[] = [];
+
+      for (const pct of otmPercents) {
+        const callStrike = roundStrike(stockPrice * (1 + pct / 100));
+        const putStrike = roundStrike(stockPrice * (1 - pct / 100));
+        const callTicker = optionTicker(upper, nextFri, "C", callStrike);
+        const putTicker = optionTicker(upper, nextFri, "P", putStrike);
+
+        fwdFetches.push(
+          getWeekVolume(callTicker, fmtDate(weekStart), fmtDate(fri)).then((res) => {
+            const days = Math.max(res.bars.length, 1);
+            fwdCalls.push({
+              otmPercent: pct,
+              strike: callStrike,
+              ticker: callTicker,
+              totalVolume: res.totalVolume,
+              totalTrades: res.totalTrades,
+              dailyAvgVolume: res.totalVolume / days,
+              dailyBars: res.bars.map(barToDailyBar),
+            });
+          })
+        );
+
+        fwdFetches.push(
+          getWeekVolume(putTicker, fmtDate(weekStart), fmtDate(fri)).then((res) => {
+            const days = Math.max(res.bars.length, 1);
+            fwdPuts.push({
+              otmPercent: pct,
+              strike: putStrike,
+              ticker: putTicker,
+              totalVolume: res.totalVolume,
+              totalTrades: res.totalTrades,
+              dailyAvgVolume: res.totalVolume / days,
+              dailyBars: res.bars.map(barToDailyBar),
+            });
+          })
+        );
+      }
+
+      await Promise.all(fwdFetches);
+      fwdCalls.sort((a, b) => a.otmPercent - b.otmPercent);
+      fwdPuts.sort((a, b) => a.otmPercent - b.otmPercent);
+
+      forwardData.push({
+        weekRange: { start: fmtDate(weekStart), end: fmtDate(fri) },
+        nextExpiration: fmtDate(nextFri),
+        calls: fwdCalls,
+        puts: fwdPuts,
       });
     }
 
@@ -477,6 +550,225 @@ export async function GET(
               });
             }
           }
+        }
+      }
+    }
+
+    // --- SIGNAL 4b: Forward-Week Pre-Loading ---
+    // Detect unusual volume in NEXT week's expiration options during the CURRENT week.
+    // Catches pre-event positioning (e.g., buying Jan 31 puts on Jan 22 before a Jan 27 crash).
+    const currentForward = forwardData[0];
+    const priorForwards = forwardData.slice(1);
+
+    for (const type of ["call", "put"] as const) {
+      const fwdContracts = type === "call" ? currentForward.calls : currentForward.puts;
+
+      for (const current of fwdContracts) {
+        const priorMatches = priorForwards.map((fwd) => {
+          const contracts = type === "call" ? fwd.calls : fwd.puts;
+          return contracts.find((c) => c.otmPercent === current.otmPercent);
+        });
+
+        const priorDailyAvgs = priorMatches
+          .filter((m): m is StrikeData => !!m && m.dailyAvgVolume > 0)
+          .map((m) => m.dailyAvgVolume);
+        const historicalAvgDaily =
+          priorDailyAvgs.length > 0
+            ? priorDailyAvgs.reduce((s, v) => s + v, 0) / priorDailyAvgs.length
+            : 0;
+
+        const fwdMult =
+          historicalAvgDaily > 0
+            ? current.dailyAvgVolume / historicalAvgDaily
+            : current.dailyAvgVolume >= 50 ? 20 : 0;
+
+        const minDailyVol = current.otmPercent >= 30 ? 10 : current.otmPercent >= 20 ? 20 : 75;
+        const minFwdMult = historicalAvgDaily < 5 ? 10 : 3;
+
+        const fwdBreakdown = [
+          {
+            expiration: `${currentForward.weekRange.start}→${currentForward.nextExpiration}`,
+            strike: current.strike,
+            totalVolume: current.totalVolume,
+            dailyAvgVolume: Math.round(current.dailyAvgVolume),
+          },
+          ...priorMatches.map((m, idx) => ({
+            expiration: `${priorForwards[idx].weekRange.start}→${priorForwards[idx].nextExpiration}`,
+            strike: m?.strike || 0,
+            totalVolume: m?.totalVolume || 0,
+            dailyAvgVolume: Math.round(m?.dailyAvgVolume || 0),
+          })),
+        ];
+
+        if (fwdMult >= minFwdMult && current.dailyAvgVolume >= minDailyVol) {
+          signals.push({
+            id: `forward_${type}_${current.otmPercent}`,
+            signalType: "forward_positioning",
+            type,
+            otmPercent: current.otmPercent,
+            strike: current.strike,
+            ticker: current.ticker,
+            severity: severity(fwdMult),
+            multiplier: Math.round(fwdMult * 10) / 10,
+            title: `Forward-week ${type} volume ${Math.round(fwdMult * 10) / 10}x normal`,
+            description: `${type.toUpperCase()} $${current.strike} (${current.otmPercent}% OTM, exp ${currentForward.nextExpiration}) traded ${Math.round(current.dailyAvgVolume).toLocaleString()}/day this week vs historical ${Math.round(historicalAvgDaily).toLocaleString()}/day. Pre-loading next week's expiration.`,
+            evidence: {
+              currentDailyAvg: Math.round(current.dailyAvgVolume),
+              historicalDailyAvg: Math.round(historicalAvgDaily),
+              nextExpiration: currentForward.nextExpiration,
+              tradedDuring: currentForward.weekRange,
+            },
+            weeklyBreakdown: fwdBreakdown,
+          });
+        }
+
+        // Forward-week block trade detection
+        for (const bar of current.dailyBars) {
+          if (bar.trades > 0 && bar.volume > 20) {
+            const avgSize = bar.volume / bar.trades;
+
+            const priorSizes = priorMatches
+              .filter((m): m is StrikeData => !!m)
+              .flatMap((m) => m.dailyBars)
+              .filter((b) => b.trades > 0 && b.volume > 5)
+              .map((b) => b.volume / b.trades);
+
+            const histAvgSize =
+              priorSizes.length > 0
+                ? priorSizes.reduce((s, v) => s + v, 0) / priorSizes.length
+                : 0;
+
+            const sizeMult = histAvgSize > 0 ? avgSize / histAvgSize : avgSize >= 50 ? 20 : 0;
+            const minBlockVol = current.otmPercent >= 20 ? 50 : 100;
+
+            if (sizeMult >= 3 && avgSize >= 15 && bar.volume >= minBlockVol) {
+              signals.push({
+                id: `fwd_block_${type}_${current.otmPercent}_${bar.date}`,
+                signalType: "forward_positioning",
+                type,
+                otmPercent: current.otmPercent,
+                strike: current.strike,
+                ticker: current.ticker,
+                severity: severity(sizeMult),
+                multiplier: Math.round(sizeMult * 10) / 10,
+                title: `Forward-week block trade on ${bar.date}`,
+                description: `${type.toUpperCase()} $${current.strike} (exp ${currentForward.nextExpiration}): ${bar.volume.toLocaleString()} vol in ${bar.trades} trades (avg ${Math.round(avgSize)}/trade vs historical ${Math.round(histAvgSize)}). Pre-event block positioning.`,
+                evidence: {
+                  date: bar.date,
+                  volume: bar.volume,
+                  trades: bar.trades,
+                  avgTradeSize: Math.round(avgSize),
+                  historicalAvgSize: Math.round(histAvgSize),
+                  nextExpiration: currentForward.nextExpiration,
+                },
+                weeklyBreakdown: fwdBreakdown,
+              });
+            }
+          }
+        }
+      }
+    }
+
+    // --- SIGNAL 4c: Forward-Week Premium Anomaly ---
+    // Compare the end-of-week option price (normalized by stock price) for next-week
+    // expiration options at 10/15/20% OTM vs prior Fridays.
+    // Uses BOTH 3-week average AND week-over-week comparison (takes the higher multiplier).
+    // WoW catches sudden premium spikes even when older weeks were also elevated.
+    const premiumOtmLevels = [10, 15, 20];
+
+    for (const type of ["call", "put"] as const) {
+      for (const pct of premiumOtmLevels) {
+        // Get the last bar (Friday close) for each week's forward option at this OTM level
+        const weekPremiums: {
+          weekEnd: string;
+          nextExp: string;
+          strike: number;
+          optionClose: number;
+          stockPrice: number;
+          normalizedPremium: number; // option_price / stock_price in basis points
+        }[] = [];
+
+        for (let i = 0; i < forwardData.length; i++) {
+          const fwd = forwardData[i];
+          const contracts = type === "call" ? fwd.calls : fwd.puts;
+          const contract = contracts.find((c) => c.otmPercent === pct);
+          if (!contract || contract.dailyBars.length === 0) continue;
+
+          const lastBar = contract.dailyBars[contract.dailyBars.length - 1];
+          const stockPrice = weeklyData[i].stockPrice;
+          if (lastBar.close <= 0 || stockPrice <= 0) continue;
+
+          weekPremiums.push({
+            weekEnd: fwd.weekRange.end,
+            nextExp: fwd.nextExpiration,
+            strike: contract.strike,
+            optionClose: lastBar.close,
+            stockPrice,
+            normalizedPremium: (lastBar.close / stockPrice) * 10000, // basis points
+          });
+        }
+
+        if (weekPremiums.length < 2) continue;
+
+        const currentPremium = weekPremiums[0];
+        const priorPremiums = weekPremiums.slice(1).filter((p) => p.normalizedPremium > 0);
+        if (priorPremiums.length === 0) continue;
+
+        // 3-week average comparison
+        const avgPriorPremium =
+          priorPremiums.reduce((s, p) => s + p.normalizedPremium, 0) / priorPremiums.length;
+        const avgMult = avgPriorPremium > 0 ? currentPremium.normalizedPremium / avgPriorPremium : 0;
+
+        // Week-over-week comparison (vs immediately prior week only)
+        const priorWeekPremium = priorPremiums[0]; // most recent prior week
+        const wowMult = priorWeekPremium.normalizedPremium > 0
+          ? currentPremium.normalizedPremium / priorWeekPremium.normalizedPremium
+          : 0;
+
+        // Use the higher of the two multipliers
+        const premiumMult = Math.max(avgMult, wowMult);
+        const comparisonType = wowMult > avgMult ? "week-over-week" : "vs 3-week avg";
+
+        // Trigger at 2x — premium anomalies are already normalized by stock price and OTM level.
+        // Lower severity thresholds than volume signals since premium changes are more meaningful.
+        if (premiumMult >= 2) {
+          const premBreakdown = weekPremiums.map((p) => ({
+            expiration: `${p.weekEnd} → ${p.nextExp}`,
+            strike: p.strike,
+            totalVolume: 0,
+            dailyAvgVolume: Math.round(p.normalizedPremium * 100) / 100,
+          }));
+
+          signals.push({
+            id: `fwd_premium_${type}_${pct}`,
+            signalType: "forward_premium",
+            type,
+            otmPercent: pct,
+            strike: currentPremium.strike,
+            ticker: `${upper} ${type.toUpperCase()} $${currentPremium.strike}`,
+            severity: premiumMult >= 4 ? "extreme" : premiumMult >= 3 ? "high" : premiumMult >= 2 ? "medium" : "low",
+            multiplier: Math.round(premiumMult * 10) / 10,
+            title: `Forward ${type} premium ${(premiumMult).toFixed(1)}x ${comparisonType} at ${pct}% OTM`,
+            description: `${type.toUpperCase()} $${currentPremium.strike} (${pct}% OTM, exp ${currentPremium.nextExp}) closed at $${currentPremium.optionClose.toFixed(2)} (${currentPremium.normalizedPremium.toFixed(1)} bps of stock). Prior week: $${priorWeekPremium.optionClose.toFixed(2)} (${priorWeekPremium.normalizedPremium.toFixed(1)} bps). 3-week avg: ${avgPriorPremium.toFixed(1)} bps. Elevated premium = market pricing in risk.`,
+            evidence: {
+              currentPrice: currentPremium.optionClose,
+              currentBps: Math.round(currentPremium.normalizedPremium * 10) / 10,
+              priorWeekBps: Math.round(priorWeekPremium.normalizedPremium * 10) / 10,
+              wowMultiplier: Math.round(wowMult * 10) / 10,
+              historicalAvgBps: Math.round(avgPriorPremium * 10) / 10,
+              avgMultiplier: Math.round(avgMult * 10) / 10,
+              nextExpiration: currentPremium.nextExp,
+              weekEnding: currentPremium.weekEnd,
+              priorWeeks: priorPremiums.map((p) => ({
+                weekEnding: p.weekEnd,
+                nextExp: p.nextExp,
+                strike: p.strike,
+                price: p.optionClose,
+                bps: Math.round(p.normalizedPremium * 10) / 10,
+              })),
+            },
+            weeklyBreakdown: premBreakdown,
+          });
         }
       }
     }
@@ -811,6 +1103,7 @@ export async function GET(
       signals: flaggedSignals,
       normalSignals,
       weeklyData,
+      forwardData,
     });
   } catch (error) {
     const message = error instanceof Error ? error.message : "Unknown error";

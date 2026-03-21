@@ -5,7 +5,7 @@ import Link from "next/link";
 
 interface Signal {
   id: string;
-  signalType: "weekly_volume" | "daily_spike" | "block_trade" | "price_divergence" | "put_call_ratio" | "iv_skew" | "oi_surge" | "term_structure";
+  signalType: "weekly_volume" | "daily_spike" | "block_trade" | "price_divergence" | "put_call_ratio" | "iv_skew" | "oi_surge" | "term_structure" | "forward_positioning" | "forward_premium";
   type: "call" | "put";
   otmPercent: number;
   strike: number;
@@ -78,6 +78,8 @@ const SIGNAL_TYPE_LABELS: Record<string, { label: string; icon: string; color: s
   iv_skew: { label: "IV Skew", icon: "S", color: "purple" },
   oi_surge: { label: "OI Surge", icon: "O", color: "blue" },
   term_structure: { label: "Term Structure", icon: "T", color: "amber" },
+  forward_positioning: { label: "Forward Positioning", icon: "F", color: "emerald" },
+  forward_premium: { label: "Forward Premium", icon: "$", color: "red" },
 };
 
 export default function AnalyzePage() {
