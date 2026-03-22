@@ -150,6 +150,12 @@ export default function Home() {
             >
               Anomaly Scanner
             </Link>
+            <Link
+              href="/intraday"
+              className="text-sm text-zinc-400 hover:text-zinc-300 transition-colors"
+            >
+              Intraday
+            </Link>
           </div>
           <form
             onSubmit={(e) => {
