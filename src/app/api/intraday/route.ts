@@ -25,6 +25,39 @@ async function fetchEarningsDates(symbol: string): Promise<EarningsQuarter[]> {
   }
 }
 
+interface AVOptionContract {
+  contractID: string;
+  open_interest: string;
+  implied_volatility: string;
+  delta: string;
+  gamma: string;
+  theta: string;
+  vega: string;
+}
+
+async function fetchHistoricalOptions(symbol: string, date: string): Promise<Map<string, AVOptionContract>> {
+  const map = new Map<string, AVOptionContract>();
+  try {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 15000);
+    const res = await fetch(
+      `https://www.alphavantage.co/query?function=HISTORICAL_OPTIONS&symbol=${symbol}&date=${date}&apikey=${ALPHA_VANTAGE_KEY}`,
+      { signal: controller.signal }
+    );
+    clearTimeout(timeout);
+    const json = await res.json();
+    const data = json.data || [];
+    for (const contract of data) {
+      if (contract.contractID) {
+        map.set(contract.contractID, contract);
+      }
+    }
+  } catch {
+    // ignore — OI/IV will just be null
+  }
+  return map;
+}
+
 type Bar = { o: number; c: number; h: number; l: number; v: number; vw: number; n: number; t: number };
 
 function getSameDayOfWeek(dateStr: string, weeksBack: number): string {
@@ -150,10 +183,20 @@ export async function GET(request: NextRequest) {
       return { actualDate: tradingDay, stockBars: hourly.results || [] };
     }
 
-    const [tradingDays, earningsData] = await Promise.all([
-      Promise.all(dates.map(fetchTradingDay)),
+    const tradingDays = await Promise.all(dates.map(fetchTradingDay));
+
+    // Fetch Alpha Vantage data: earnings in parallel with first 2 historical options,
+    // then remaining 2 (serialize to respect 60 req/min rate limit)
+    const [earningsData, histOpt0, histOpt1] = await Promise.all([
       fetchEarningsDates(symbol),
+      fetchHistoricalOptions(symbol, tradingDays[0].actualDate),
+      fetchHistoricalOptions(symbol, tradingDays[1].actualDate),
     ]);
+    const [histOpt2, histOpt3] = await Promise.all([
+      fetchHistoricalOptions(symbol, tradingDays[2].actualDate),
+      fetchHistoricalOptions(symbol, tradingDays[3].actualDate),
+    ]);
+    const historicalOptionsChains = [histOpt0, histOpt1, histOpt2, histOpt3];
 
     // Build a set of earnings dates for quick lookup
     const earningsMap = new Map<string, { reportTime: string; estimatedEPS: string; reportedEPS: string | null; surprise: string | null; surprisePercentage: string | null }>();
@@ -200,6 +243,7 @@ export async function GET(request: NextRequest) {
     const weeks = tradingDays.map((td, i) => {
       const expDate = expirations[i];
       const { hourStrikeMap, optionBarsMap, optionDayMap } = weekOptionData[i];
+      const avContracts = historicalOptionsChains[i];
 
       const hours = [];
       for (let cstHour = 9; cstHour <= 15; cstHour++) {
@@ -234,8 +278,8 @@ export async function GET(request: NextRequest) {
         });
       }
 
-      // Build day summary per OTM tier from daily option bars
-      const daySummary: Record<string, { strike: number; vwap: number | null; volume: number | null; open: number | null; close: number | null } | null> = {};
+      // Build day summary per OTM tier from daily option bars + Alpha Vantage OI/IV
+      const daySummary: Record<string, { strike: number; vwap: number | null; volume: number | null; open: number | null; close: number | null; openInterest: number | null; impliedVolatility: number | null } | null> = {};
       for (const pct of OTM_PCTS) {
         // Collect all unique tickers used at this OTM% across hours
         const tickersAtPct = new Set<string>();
@@ -246,21 +290,30 @@ export async function GET(request: NextRequest) {
         // If multiple strikes were used (price moved), pick the one with most volume
         let bestBar: Bar | null = null;
         let bestStrike = 0;
+        let bestTicker = "";
         for (const t of tickersAtPct) {
           const dayBar = optionDayMap[t];
           if (dayBar && (bestBar === null || dayBar.v > bestBar.v)) {
             bestBar = dayBar;
-            // Extract strike from ticker
+            bestTicker = t;
             const strikeInfo = Object.values(hourStrikeMap).find((h) => h[`otm${pct}`]?.ticker === t)?.[`otm${pct}`];
             bestStrike = strikeInfo?.strike ?? 0;
           }
         }
+
+        // Look up OI and IV from Alpha Vantage historical options
+        // Our ticker: "O:NVDA260227P00150000", AV contractID: "NVDA260227P00150000"
+        const avContractId = bestTicker.replace("O:", "");
+        const avContract = avContractId ? avContracts.get(avContractId) : undefined;
+
         daySummary[`otm${pct}`] = bestBar ? {
           strike: bestStrike,
           vwap: bestBar.vw,
           volume: Math.round(bestBar.v),
           open: bestBar.o,
           close: bestBar.c,
+          openInterest: avContract ? parseInt(avContract.open_interest) || null : null,
+          impliedVolatility: avContract ? parseFloat(avContract.implied_volatility) || null : null,
         } : null;
       }
 

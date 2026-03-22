@@ -28,6 +28,8 @@ interface DaySummaryInfo {
   volume: number | null;
   open: number | null;
   close: number | null;
+  openInterest: number | null;
+  impliedVolatility: number | null;
 }
 
 interface EarningsInfo {
@@ -354,29 +356,52 @@ export default function IntradayPage() {
                         })}
                         {/* Day summary row from API */}
                         {week.daySummary && (
-                          <tr className="border-t border-zinc-700/50 bg-zinc-800/20 font-medium">
-                            <td className="px-3 py-2 text-zinc-300 text-xs">DAY</td>
-                            <td className="px-3 py-2 text-right font-mono text-zinc-200">
-                              {fmt(week.summary.close)}
-                            </td>
-                            {(["otm5", "otm10", "otm15", "otm20"] as const).map((key, idx) => {
-                              const ds = week.daySummary[key];
-                              return (
-                                <React.Fragment key={idx}>
-                                  <td className="px-1 py-2 text-right font-mono text-sm text-zinc-300">
-                                    {ds?.vwap !== null && ds?.vwap !== undefined
-                                      ? `$${ds.vwap.toFixed(2)}`
-                                      : <span className="text-zinc-700">—</span>}
-                                  </td>
-                                  <td className="px-1 py-2 text-right font-mono text-xs text-zinc-400">
-                                    {ds?.volume !== null && ds?.volume !== undefined
-                                      ? ds.volume.toLocaleString()
-                                      : <span className="text-zinc-700">—</span>}
-                                  </td>
-                                </React.Fragment>
-                              );
-                            })}
-                          </tr>
+                          <>
+                            <tr className="border-t border-zinc-700/50 bg-zinc-800/20 font-medium">
+                              <td className="px-3 py-2 text-zinc-300 text-xs">DAY</td>
+                              <td className="px-3 py-2 text-right font-mono text-zinc-200">
+                                {fmt(week.summary.close)}
+                              </td>
+                              {(["otm5", "otm10", "otm15", "otm20"] as const).map((key, idx) => {
+                                const ds = week.daySummary[key];
+                                return (
+                                  <React.Fragment key={idx}>
+                                    <td className="px-1 py-2 text-right font-mono text-sm text-zinc-300">
+                                      {ds?.vwap !== null && ds?.vwap !== undefined
+                                        ? `$${ds.vwap.toFixed(2)}`
+                                        : <span className="text-zinc-700">—</span>}
+                                    </td>
+                                    <td className="px-1 py-2 text-right font-mono text-xs text-zinc-400">
+                                      {ds?.volume !== null && ds?.volume !== undefined
+                                        ? ds.volume.toLocaleString()
+                                        : <span className="text-zinc-700">—</span>}
+                                    </td>
+                                  </React.Fragment>
+                                );
+                              })}
+                            </tr>
+                            <tr className="bg-zinc-800/30">
+                              <td className="px-3 py-1.5 text-zinc-500 text-[10px]">OI / IV</td>
+                              <td></td>
+                              {(["otm5", "otm10", "otm15", "otm20"] as const).map((key, idx) => {
+                                const ds = week.daySummary[key];
+                                return (
+                                  <React.Fragment key={idx}>
+                                    <td className="px-1 py-1.5 text-right font-mono text-[10px] text-cyan-400/80">
+                                      {ds?.openInterest != null
+                                        ? ds.openInterest.toLocaleString()
+                                        : <span className="text-zinc-700">—</span>}
+                                    </td>
+                                    <td className="px-1 py-1.5 text-right font-mono text-[10px] text-violet-400/80">
+                                      {ds?.impliedVolatility != null
+                                        ? `${(ds.impliedVolatility * 100).toFixed(0)}%`
+                                        : <span className="text-zinc-700">—</span>}
+                                    </td>
+                                  </React.Fragment>
+                                );
+                              })}
+                            </tr>
+                          </>
                         )}
                       </tbody>
                     </table>
