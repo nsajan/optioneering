@@ -42,6 +42,27 @@ function delay(ms: number) {
   return new Promise((r) => setTimeout(r, ms));
 }
 
+// Third Friday of the month = monthly opex
+function getThirdFriday(year: number, month: number): Date {
+  const d = new Date(Date.UTC(year, month, 1));
+  // Find first Friday
+  const dayOfWeek = d.getUTCDay();
+  const firstFriday = dayOfWeek <= 5 ? (5 - dayOfWeek + 1) : (5 + 7 - dayOfWeek + 1);
+  // Third Friday = first Friday + 14
+  return new Date(Date.UTC(year, month, firstFriday + 14));
+}
+
+function isOpexWeek(dateStr: string): boolean {
+  const d = new Date(dateStr + "T12:00:00Z");
+  const thirdFri = getThirdFriday(d.getUTCFullYear(), d.getUTCMonth());
+  const opexMon = new Date(thirdFri);
+  opexMon.setUTCDate(thirdFri.getUTCDate() - 4);
+  // Compare as date strings to avoid time-of-day issues
+  const monStr = opexMon.toISOString().split("T")[0];
+  const friStr = thirdFri.toISOString().split("T")[0];
+  return dateStr >= monStr && dateStr <= friStr;
+}
+
 const OTM_TIERS = [
   { label: "2%", min: 0, max: 2 },
   { label: "5%", min: 2, max: 5 },
@@ -102,6 +123,7 @@ export async function GET(request: NextRequest) {
       date: string;
       stockPrice: number;
       expiration: string;
+      opex: boolean;
       tiers: {
         label: string;
         otmMid: number;
@@ -118,6 +140,7 @@ export async function GET(request: NextRequest) {
     const dayPoints: DayPoint[] = tradingDays.map((td) => {
       const chain = chains.get(td.date) || [];
       const exp = getNearestFriday(td.date);
+      const opex = isOpexWeek(td.date);
 
       const filtered = chain.filter(
         (c) => c.type === optionType && c.expiration === exp
@@ -157,13 +180,14 @@ export async function GET(request: NextRequest) {
         date: td.date,
         stockPrice: td.close,
         expiration: exp,
+        opex,
         tiers,
         totalVolume: filtered.reduce((s, c) => s + parseInt(c.volume), 0),
         totalOI: filtered.reduce((s, c) => s + parseInt(c.open_interest), 0),
       };
     });
 
-    // Compute rolling averages for each tier (use all prior days as baseline)
+    // Compute averages excluding opex week days from baseline
     const dots: {
       date: string;
       stockPrice: number;
@@ -174,12 +198,13 @@ export async function GET(request: NextRequest) {
       oi: number;
       avgVolume: number;
       multiplier: number | null;
+      opex: boolean;
     }[] = [];
 
     for (let i = 0; i < dayPoints.length; i++) {
       const dp = dayPoints[i];
-      // Use all days except current as baseline
-      const others = dayPoints.filter((_, j) => j !== i);
+      // Baseline: exclude current day AND opex week days
+      const others = dayPoints.filter((o, j) => j !== i && !o.opex);
 
       for (const tier of dp.tiers) {
         const otherVols = others
@@ -199,6 +224,7 @@ export async function GET(request: NextRequest) {
           oi: tier.oi,
           avgVolume: Math.round(avgVol),
           multiplier: avgVol > 0 ? tier.volume / avgVol : null,
+          opex: dp.opex,
         });
       }
     }
@@ -212,6 +238,7 @@ export async function GET(request: NextRequest) {
         close: td.close,
         high: td.high,
         low: td.low,
+        opex: isOpexWeek(td.date),
       })),
       dots,
       tiers: OTM_TIERS.map((t) => t.label),

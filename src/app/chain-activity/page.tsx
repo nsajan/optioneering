@@ -8,6 +8,7 @@ interface TradingDay {
   close: number;
   high: number;
   low: number;
+  opex: boolean;
 }
 
 interface Dot {
@@ -20,6 +21,7 @@ interface Dot {
   oi: number;
   avgVolume: number;
   multiplier: number | null;
+  opex: boolean;
 }
 
 interface ActivityData {
@@ -247,6 +249,7 @@ export default function ChainActivityPage() {
                 <span className="flex items-center gap-1"><span className="inline-block w-4 h-4 rounded-full" style={{ background: "rgba(248,113,113,0.9)" }} /> 10x+</span>
               </div>
               <span className="text-purple-400">Purple line = selected date</span>
+              <span className="flex items-center gap-1"><span className="inline-block w-2 h-2 rounded-full border border-zinc-600 border-dashed" /> opex week (excluded from avg)</span>
             </div>
 
             {/* Chart */}
@@ -328,7 +331,7 @@ export default function ChainActivityPage() {
                     const cx = chart.xScale(idx);
                     const cy = chart.yScale(dot.strikePrice);
                     const r = dotRadius(dot.volume, chart.maxVol);
-                    const color = dotColor(dot.multiplier);
+                    const color = dot.opex ? "rgba(63,63,70,0.2)" : dotColor(dot.multiplier);
 
                     return (
                       <circle
@@ -337,11 +340,12 @@ export default function ChainActivityPage() {
                         cy={cy}
                         r={r}
                         fill={color}
-                        stroke={dot.multiplier && dot.multiplier >= 5 ? "rgba(255,255,255,0.15)" : "none"}
-                        strokeWidth="0.5"
+                        stroke={dot.opex ? "rgba(63,63,70,0.3)" : dot.multiplier && dot.multiplier >= 5 ? "rgba(255,255,255,0.15)" : "none"}
+                        strokeWidth={dot.opex ? "1" : "0.5"}
+                        strokeDasharray={dot.opex ? "2,2" : "none"}
                         onMouseEnter={() => setHoveredDot(dot)}
                         onMouseLeave={() => setHoveredDot(null)}
-                        style={{ cursor: "crosshair" }}
+                        style={{ cursor: "crosshair", opacity: dot.opex ? 0.4 : 1 }}
                       />
                     );
                   })}
@@ -376,7 +380,10 @@ export default function ChainActivityPage() {
                     top: mousePos.y - 80,
                   }}
                 >
-                  <div className="text-zinc-300 font-medium mb-1">{hoveredDot.date} — {hoveredDot.tier} OTM</div>
+                  <div className="text-zinc-300 font-medium mb-1">
+                    {hoveredDot.date} — {hoveredDot.tier} OTM
+                    {hoveredDot.opex && <span className="ml-2 text-zinc-500 text-[9px]">OPEX WEEK</span>}
+                  </div>
                   <div className="text-zinc-400">Strike: ${hoveredDot.strikePrice.toFixed(0)} | Stock: ${hoveredDot.stockPrice.toFixed(2)}</div>
                   <div className="flex gap-4 mt-1">
                     <span className="text-zinc-200">Vol: {hoveredDot.volume.toLocaleString()}</span>
@@ -426,8 +433,9 @@ export default function ChainActivityPage() {
                           key={td.date}
                           className={`border-b border-zinc-800/20 ${isSelected ? "bg-purple-500/5" : ""}`}
                         >
-                          <td className={`px-3 py-1.5 font-mono sticky left-0 ${isSelected ? "text-purple-400 bg-purple-500/5" : "text-zinc-400 bg-zinc-900/90"}`}>
+                          <td className={`px-3 py-1.5 font-mono sticky left-0 ${isSelected ? "text-purple-400 bg-purple-500/5" : td.opex ? "text-zinc-600 bg-zinc-900/90" : "text-zinc-400 bg-zinc-900/90"}`}>
                             {td.date.slice(5)}
+                            {td.opex && <span className="ml-1 text-[8px] text-zinc-600">opex</span>}
                           </td>
                           <td className="px-3 py-1.5 text-right font-mono text-zinc-300">
                             ${td.close.toFixed(2)}
