@@ -1,6 +1,30 @@
 import { NextRequest, NextResponse } from "next/server";
 import { getAggregateBars } from "@/lib/massive";
 
+const ALPHA_VANTAGE_KEY = process.env.ALPHA_VANTAGE_API_KEY!;
+
+interface EarningsQuarter {
+  fiscalDateEnding: string;
+  reportedDate: string;
+  reportedEPS: string;
+  estimatedEPS: string;
+  surprise: string;
+  surprisePercentage: string;
+  reportTime: string; // "pre-market" | "post-market"
+}
+
+async function fetchEarningsDates(symbol: string): Promise<EarningsQuarter[]> {
+  try {
+    const res = await fetch(
+      `https://www.alphavantage.co/query?function=EARNINGS&symbol=${symbol}&apikey=${ALPHA_VANTAGE_KEY}`
+    );
+    const json = await res.json();
+    return json.quarterlyEarnings || [];
+  } catch {
+    return [];
+  }
+}
+
 type Bar = { o: number; c: number; h: number; l: number; v: number; vw: number; n: number; t: number };
 
 function getSameDayOfWeek(dateStr: string, weeksBack: number): string {
@@ -126,7 +150,24 @@ export async function GET(request: NextRequest) {
       return { actualDate: tradingDay, stockBars: hourly.results || [] };
     }
 
-    const tradingDays = await Promise.all(dates.map(fetchTradingDay));
+    const [tradingDays, earningsData] = await Promise.all([
+      Promise.all(dates.map(fetchTradingDay)),
+      fetchEarningsDates(symbol),
+    ]);
+
+    // Build a set of earnings dates for quick lookup
+    const earningsMap = new Map<string, { reportTime: string; estimatedEPS: string; reportedEPS: string | null; surprise: string | null; surprisePercentage: string | null }>();
+    for (const eq of earningsData) {
+      if (eq.reportedDate) {
+        earningsMap.set(eq.reportedDate, {
+          reportTime: eq.reportTime || "",
+          estimatedEPS: eq.estimatedEPS,
+          reportedEPS: eq.reportedEPS !== "None" ? eq.reportedEPS : null,
+          surprise: eq.surprise !== "None" ? eq.surprise : null,
+          surprisePercentage: eq.surprisePercentage !== "None" ? eq.surprisePercentage : null,
+        });
+      }
+    }
 
     // Step 2: Resolve expirations
     const expirations = await Promise.all(tradingDays.map((td) => findExpiration(symbol, td.actualDate)));
@@ -137,23 +178,28 @@ export async function GET(request: NextRequest) {
         const expDate = expirations[i];
         const { tickers, hourStrikeMap } = getOptionTickersForDay(td.stockBars, utcOffset, symbol, expDate, optionType);
 
-        // Fetch hourly bars for all unique option tickers in parallel
+        // Fetch hourly + daily bars for all unique option tickers in parallel
         const optionBarsMap: Record<string, Bar[]> = {};
+        const optionDayMap: Record<string, Bar | null> = {};
         await Promise.all(
           tickers.map(async (ticker) => {
-            const res = await getAggregateBars(ticker, td.actualDate, td.actualDate, "hour", 1).catch(() => ({ results: [] as Bar[], resultsCount: 0 }));
-            optionBarsMap[ticker] = res.results || [];
+            const [hourly, daily] = await Promise.all([
+              getAggregateBars(ticker, td.actualDate, td.actualDate, "hour", 1).catch(() => ({ results: [] as Bar[], resultsCount: 0 })),
+              getAggregateBars(ticker, td.actualDate, td.actualDate, "day", 1).catch(() => ({ results: [] as Bar[], resultsCount: 0 })),
+            ]);
+            optionBarsMap[ticker] = hourly.results || [];
+            optionDayMap[ticker] = daily.results?.[0] ?? null;
           })
         );
 
-        return { hourStrikeMap, optionBarsMap };
+        return { hourStrikeMap, optionBarsMap, optionDayMap };
       })
     );
 
     // Step 4: Build response
     const weeks = tradingDays.map((td, i) => {
       const expDate = expirations[i];
-      const { hourStrikeMap, optionBarsMap } = weekOptionData[i];
+      const { hourStrikeMap, optionBarsMap, optionDayMap } = weekOptionData[i];
 
       const hours = [];
       for (let cstHour = 9; cstHour <= 15; cstHour++) {
@@ -188,12 +234,47 @@ export async function GET(request: NextRequest) {
         });
       }
 
+      // Build day summary per OTM tier from daily option bars
+      const daySummary: Record<string, { strike: number; vwap: number | null; volume: number | null; open: number | null; close: number | null } | null> = {};
+      for (const pct of OTM_PCTS) {
+        // Collect all unique tickers used at this OTM% across hours
+        const tickersAtPct = new Set<string>();
+        for (const hourData of Object.values(hourStrikeMap)) {
+          const info = hourData[`otm${pct}`];
+          if (info) tickersAtPct.add(info.ticker);
+        }
+        // If multiple strikes were used (price moved), pick the one with most volume
+        let bestBar: Bar | null = null;
+        let bestStrike = 0;
+        for (const t of tickersAtPct) {
+          const dayBar = optionDayMap[t];
+          if (dayBar && (bestBar === null || dayBar.v > bestBar.v)) {
+            bestBar = dayBar;
+            // Extract strike from ticker
+            const strikeInfo = Object.values(hourStrikeMap).find((h) => h[`otm${pct}`]?.ticker === t)?.[`otm${pct}`];
+            bestStrike = strikeInfo?.strike ?? 0;
+          }
+        }
+        daySummary[`otm${pct}`] = bestBar ? {
+          strike: bestStrike,
+          vwap: bestBar.vw,
+          volume: Math.round(bestBar.v),
+          open: bestBar.o,
+          close: bestBar.c,
+        } : null;
+      }
+
+      // Check if this week's trading date has earnings
+      const earningsInfo = earningsMap.get(td.actualDate) || null;
+
       return {
         date: td.actualDate,
         weeksAgo: i,
         label: i === 0 ? "Selected Date" : `${i} Week${i > 1 ? "s" : ""} Before`,
         expiration: expDate,
+        earnings: earningsInfo,
         summary: buildSummary(td.stockBars),
+        daySummary,
         hours,
       };
     });

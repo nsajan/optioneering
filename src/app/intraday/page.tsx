@@ -22,14 +22,37 @@ interface HourData {
   otm20: StrikeInfo | null;
 }
 
+interface DaySummaryInfo {
+  strike: number;
+  vwap: number | null;
+  volume: number | null;
+  open: number | null;
+  close: number | null;
+}
+
+interface EarningsInfo {
+  reportTime: string;
+  estimatedEPS: string;
+  reportedEPS: string | null;
+  surprise: string | null;
+  surprisePercentage: string | null;
+}
+
 interface WeekData {
   date: string;
   weeksAgo: number;
   label: string;
   expiration: string;
+  earnings: EarningsInfo | null;
   summary: {
     open: number | null;
     close: number | null;
+  };
+  daySummary: {
+    otm5: DaySummaryInfo | null;
+    otm10: DaySummaryInfo | null;
+    otm15: DaySummaryInfo | null;
+    otm20: DaySummaryInfo | null;
   };
   hours: HourData[];
 }
@@ -85,7 +108,7 @@ export default function IntradayPage() {
     for (const w of priorWeeks) {
       const h = w.hours.find((h) => h.hour === hour);
       if (!h) continue;
-      const s = (h as Record<string, unknown>)[otmKey] as StrikeInfo | null;
+      const s = (h as unknown as Record<string, unknown>)[otmKey] as StrikeInfo | null;
       const v = s?.[field];
       if (v !== null && v !== undefined) vals.push(v);
     }
@@ -228,6 +251,21 @@ export default function IntradayPage() {
                       </span>
                       <span className="text-zinc-600 text-xs">{week.date}</span>
                       <span className="text-zinc-700 text-xs">exp {week.expiration}</span>
+                      {week.earnings && (
+                        <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-amber-500/15 border border-amber-500/30 text-amber-400 text-[10px] font-medium">
+                          EARNINGS {week.earnings.reportTime === "pre-market" ? "PRE" : week.earnings.reportTime === "post-market" ? "POST" : ""}
+                          {week.earnings.reportedEPS && (
+                            <span className="text-amber-300">
+                              EPS {week.earnings.reportedEPS}
+                              {week.earnings.surprisePercentage && (
+                                <span className={Number(week.earnings.surprisePercentage) >= 0 ? "text-emerald-400" : "text-red-400"}>
+                                  {" "}{Number(week.earnings.surprisePercentage) >= 0 ? "+" : ""}{Number(week.earnings.surprisePercentage).toFixed(1)}%
+                                </span>
+                              )}
+                            </span>
+                          )}
+                        </span>
+                      )}
                     </div>
                     {week.summary.close !== null && (
                       <span className="font-mono text-sm text-zinc-300">{fmt(week.summary.close)}</span>
@@ -314,6 +352,32 @@ export default function IntradayPage() {
                             </tr>
                           );
                         })}
+                        {/* Day summary row from API */}
+                        {week.daySummary && (
+                          <tr className="border-t border-zinc-700/50 bg-zinc-800/20 font-medium">
+                            <td className="px-3 py-2 text-zinc-300 text-xs">DAY</td>
+                            <td className="px-3 py-2 text-right font-mono text-zinc-200">
+                              {fmt(week.summary.close)}
+                            </td>
+                            {(["otm5", "otm10", "otm15", "otm20"] as const).map((key, idx) => {
+                              const ds = week.daySummary[key];
+                              return (
+                                <React.Fragment key={idx}>
+                                  <td className="px-1 py-2 text-right font-mono text-sm text-zinc-300">
+                                    {ds?.vwap !== null && ds?.vwap !== undefined
+                                      ? `$${ds.vwap.toFixed(2)}`
+                                      : <span className="text-zinc-700">—</span>}
+                                  </td>
+                                  <td className="px-1 py-2 text-right font-mono text-xs text-zinc-400">
+                                    {ds?.volume !== null && ds?.volume !== undefined
+                                      ? ds.volume.toLocaleString()
+                                      : <span className="text-zinc-700">—</span>}
+                                  </td>
+                                </React.Fragment>
+                              );
+                            })}
+                          </tr>
+                        )}
                       </tbody>
                     </table>
                   </div>
