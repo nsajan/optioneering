@@ -162,6 +162,12 @@ export default function Home() {
             >
               Chain Scanner
             </Link>
+            <Link
+              href="/chain-activity"
+              className="text-sm text-zinc-400 hover:text-zinc-300 transition-colors"
+            >
+              Activity Map
+            </Link>
           </div>
           <form
             onSubmit={(e) => {
