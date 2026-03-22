@@ -156,6 +156,12 @@ export default function Home() {
             >
               Intraday
             </Link>
+            <Link
+              href="/chain-anomaly"
+              className="text-sm text-zinc-400 hover:text-zinc-300 transition-colors"
+            >
+              Chain Scanner
+            </Link>
           </div>
           <form
             onSubmit={(e) => {
