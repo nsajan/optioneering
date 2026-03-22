@@ -1,11 +1,15 @@
 "use client";
 
-import { useState } from "react";
+import React, { useState } from "react";
 import Link from "next/link";
+
+const OTM_LABELS = [5, 10, 15, 20];
 
 interface StrikeInfo {
   strike: number;
   ticker: string;
+  premium: number | null;
+  volume: number | null;
 }
 
 interface HourData {
@@ -72,6 +76,42 @@ export default function IntradayPage() {
   };
 
   const fmt = (v: number | null) => (v !== null ? `$${v.toFixed(2)}` : "—");
+
+  // Average of prior weeks' value for a given hour, otmKey, and field (volume or premium)
+  function getAvgPrior(hour: number, otmKey: string, field: "volume" | "premium"): number | null {
+    if (!data || data.weeks.length < 2) return null;
+    const priorWeeks = data.weeks.slice(1);
+    const vals: number[] = [];
+    for (const w of priorWeeks) {
+      const h = w.hours.find((h) => h.hour === hour);
+      if (!h) continue;
+      const s = (h as Record<string, unknown>)[otmKey] as StrikeInfo | null;
+      const v = s?.[field];
+      if (v !== null && v !== undefined) vals.push(v);
+    }
+    if (vals.length === 0) return null;
+    return vals.reduce((a, b) => a + b, 0) / vals.length;
+  }
+
+  function multColor(val: number | null | undefined, hour: number, otmKey: string, field: "volume" | "premium", isSelectedWeek: boolean): string {
+    if (!isSelectedWeek || val === null || val === undefined) return field === "volume" ? "text-zinc-500" : "text-zinc-300";
+    const avg = getAvgPrior(hour, otmKey, field);
+    if (avg === null || avg === 0) return val > 0 ? "text-yellow-400" : (field === "volume" ? "text-zinc-500" : "text-zinc-300");
+    const mult = val / avg;
+    if (mult >= 5) return "text-red-400 font-semibold";
+    if (mult >= 3) return "text-orange-400 font-medium";
+    if (mult >= 2) return "text-yellow-400";
+    return field === "volume" ? "text-zinc-500" : "text-zinc-300";
+  }
+
+  function multBadge(val: number | null | undefined, hour: number, otmKey: string, field: "volume" | "premium", isSelectedWeek: boolean): string | null {
+    if (!isSelectedWeek || val === null || val === undefined) return null;
+    const avg = getAvgPrior(hour, otmKey, field);
+    if (avg === null || avg === 0) return null;
+    const mult = val / avg;
+    if (mult >= 2) return `${mult.toFixed(1)}x`;
+    return null;
+  }
 
   return (
     <div className="min-h-screen bg-[#0a0a0f] text-zinc-100">
@@ -197,40 +237,83 @@ export default function IntradayPage() {
                     <table className="w-full text-sm">
                       <thead>
                         <tr className="border-b border-zinc-800/30 text-zinc-600 text-xs">
-                          <th className="text-left px-4 py-2 font-medium">Time</th>
-                          <th className="text-right px-4 py-2 font-medium">Price</th>
-                          <th className="text-right px-4 py-2 font-medium">5% OTM</th>
-                          <th className="text-right px-4 py-2 font-medium">10% OTM</th>
-                          <th className="text-right px-4 py-2 font-medium">15% OTM</th>
-                          <th className="text-right px-4 py-2 font-medium">20% OTM</th>
+                          <th className="text-left px-3 py-2 font-medium">Time</th>
+                          <th className="text-right px-3 py-2 font-medium">Price</th>
+                          {OTM_LABELS.map((pct) => (
+                            <th key={pct} className="text-center px-1 py-2 font-medium" colSpan={2}>
+                              {pct}% OTM
+                            </th>
+                          ))}
+                        </tr>
+                        <tr className="border-b border-zinc-800/20 text-zinc-700 text-[10px]">
+                          <th></th>
+                          <th></th>
+                          {OTM_LABELS.map((pct) => (
+                            <React.Fragment key={pct}>
+                              <th className="text-right px-1 py-1 font-normal">Premium</th>
+                              <th className="text-right px-1 py-1 font-normal">Vol</th>
+                            </React.Fragment>
+                          ))}
                         </tr>
                       </thead>
                       <tbody>
-                        {week.hours.map((h) => (
-                          <tr
-                            key={h.hour}
-                            className="border-b border-zinc-800/20 hover:bg-zinc-800/30 transition-colors"
-                          >
-                            <td className="px-4 py-2 text-zinc-400">{h.label}</td>
-                            <td className="px-4 py-2 text-right font-mono text-zinc-200">
-                              {fmt(h.close)}
-                            </td>
-                            {([h.otm5, h.otm10, h.otm15, h.otm20] as (StrikeInfo | null)[]).map((s, idx) => (
-                              <td key={idx} className="px-4 py-2 text-right">
-                                {s ? (
-                                  <div>
-                                    <span className="font-mono text-zinc-300">${s.strike}</span>
-                                    <div className="text-[10px] text-zinc-600 font-mono truncate max-w-[180px]">
-                                      {s.ticker}
-                                    </div>
-                                  </div>
-                                ) : (
-                                  <span className="text-zinc-700">—</span>
-                                )}
+                        {week.hours.map((h) => {
+                          const otmKeys = ["otm5", "otm10", "otm15", "otm20"];
+                          const strikes = [h.otm5, h.otm10, h.otm15, h.otm20];
+                          const isSelected = week.weeksAgo === 0;
+
+                          return (
+                            <tr
+                              key={h.hour}
+                              className="border-b border-zinc-800/20 hover:bg-zinc-800/30 transition-colors"
+                            >
+                              <td className="px-3 py-2 text-zinc-400">{h.label}</td>
+                              <td className="px-3 py-2 text-right font-mono text-zinc-200">
+                                {fmt(h.close)}
                               </td>
-                            ))}
-                          </tr>
-                        ))}
+                              {strikes.map((s, idx) => {
+                                const key = otmKeys[idx];
+                                const pc = multColor(s?.premium, h.hour, key, "premium", isSelected);
+                                const pBadge = multBadge(s?.premium, h.hour, key, "premium", isSelected);
+                                const vc = multColor(s?.volume, h.hour, key, "volume", isSelected);
+                                const vBadge = multBadge(s?.volume, h.hour, key, "volume", isSelected);
+
+                                return (
+                                  <React.Fragment key={idx}>
+                                    <td className={`px-1 py-2 text-right font-mono text-sm ${pc}`}>
+                                      {s?.premium !== null && s?.premium !== undefined ? (
+                                        <span>
+                                          ${s.premium.toFixed(2)}
+                                          {pBadge && (
+                                            <span className="ml-1 text-[10px] opacity-80">
+                                              {pBadge}
+                                            </span>
+                                          )}
+                                        </span>
+                                      ) : (
+                                        <span className="text-zinc-700">—</span>
+                                      )}
+                                    </td>
+                                    <td className={`px-1 py-2 text-right font-mono text-xs ${vc}`}>
+                                      {s?.volume !== null && s?.volume !== undefined ? (
+                                        <span>
+                                          {s.volume.toLocaleString()}
+                                          {vBadge && (
+                                            <span className="ml-1 text-[10px] opacity-80">
+                                              {vBadge}
+                                            </span>
+                                          )}
+                                        </span>
+                                      ) : (
+                                        <span className="text-zinc-700">—</span>
+                                      )}
+                                    </td>
+                                  </React.Fragment>
+                                );
+                              })}
+                            </tr>
+                          );
+                        })}
                       </tbody>
                     </table>
                   </div>
